@@ -3,5 +3,4 @@ opencv-python>=4.8.0
 streamlit>=1.28.0
 Pillow>=10.0.0
 numpy>=1.24.0
-PyYAML>=6.0</content>
-<parameter name="filePath">e:\NIRAL_HACKETHON\Road-Damage-Detection--main\requirements_streamlit.txt
+PyYAML>=6.0

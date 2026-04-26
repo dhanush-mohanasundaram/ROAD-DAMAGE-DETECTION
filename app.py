@@ -9,16 +9,17 @@ Run locally:  streamlit run app.py
 Deploy:       Push to GitHub → connect Streamlit Cloud
 """
 
+import glob
 import io
 import os
+import random
 import sys
 from datetime import datetime
 from typing import Optional
 
-import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 # ── Page config (MUST be first Streamlit command) ──
 st.set_page_config(
@@ -35,10 +36,9 @@ st.set_page_config(
 PROJECT_ROOT = os.path.dirname(__file__)
 sys.path.insert(0, PROJECT_ROOT)
 
-import detect
-from detect import BASE_LAT, BASE_LON, classify_severity, find_best_model, push_to_firebase
-
-MODEL_PATH = find_best_model()
+MODEL_PATH = None
+BASE_LAT = 12.9716
+BASE_LON = 77.5946
 
 if 'detections' not in st.session_state:
     st.session_state.detections = []
@@ -50,8 +50,41 @@ if 'firebase_ok' not in st.session_state:
     st.session_state.firebase_ok = False
 
 
+def find_best_model() -> str:
+    candidates = [
+        "best.pt",
+        os.path.join("weights", "best.pt"),
+        os.path.join("models", "best.pt")
+    ]
+    runs = glob.glob(os.path.join("runs", "detect", "*", "weights", "best.pt"))
+    if runs:
+        candidates.append(max(runs, key=os.path.getmtime))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return "yolov8n.pt"
+
+
+def classify_severity(confidence: float, sensors=None) -> str:
+    if sensors:
+        z_spike = sensors.get("z_spike", 0.0)
+        if confidence >= 0.80 or z_spike > 2.0:
+            return "High"
+        if confidence >= 0.60:
+            return "Medium"
+        return "Low"
+    if confidence >= 0.80:
+        return "High"
+    if confidence >= 0.60:
+        return "Medium"
+    return "Low"
+
+
 @st.cache_resource
 def load_model():
+    global MODEL_PATH
+    if MODEL_PATH is None:
+        MODEL_PATH = find_best_model()
     try:
         from ultralytics import YOLO
         model = YOLO(MODEL_PATH)
@@ -61,47 +94,69 @@ def load_model():
 
 
 def initialize_firebase() -> bool:
+    key_path = "firebase_key.json"
+    if not os.path.exists(key_path):
+        return False
     try:
-        detect.init_firebase()
-        return getattr(detect, '_firebase_ok', False)
+        import firebase_admin
+        from firebase_admin import credentials, db
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(key_path)
+            firebase_admin.initialize_app(cred, {
+                'databaseURL': os.environ.get(
+                    'FIREBASE_URL',
+                    'https://road-5ae51-default-rtdb.firebaseio.com'
+                )
+            })
+        return True
     except Exception:
         return False
 
 
-def bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
-    array = np.frombuffer(image_bytes, dtype=np.uint8)
-    image_bgr = cv2.imdecode(array, cv2.IMREAD_COLOR)
-    return image_bgr
+def push_to_firebase(record: dict) -> bool:
+    try:
+        import firebase_admin
+        from firebase_admin import db
+        db.reference('detections').push(record)
+        return True
+    except Exception:
+        return False
 
 
-def bgr_to_rgb(image_bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+def bytes_to_pil(image_bytes: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
 
-def draw_boxes(image_bgr: np.ndarray, detections: list) -> np.ndarray:
-    image = image_bgr.copy()
+def pil_to_np(image: Image.Image) -> np.ndarray:
+    return np.array(image)
+
+
+def draw_boxes(image: Image.Image, detections: list) -> Image.Image:
+    image = image.copy()
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
     color_map = {
-        'High': (239, 68, 68),
-        'Medium': (245, 158, 11),
-        'Low': (16, 185, 129)
+        'High': '#EF4444',
+        'Medium': '#F59E0B',
+        'Low': '#10B981'
     }
     for det in detections:
         x1, y1, x2, y2 = det['box']
-        color = color_map.get(det['severity'], (148, 163, 184))
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 3)
+        color = color_map.get(det['severity'], '#94A3B8')
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
         label = f"{det['label']} {det['confidence']:.0%}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(image, (x1, y1 - th - 12), (x1 + tw + 8, y1), color, -1)
-        cv2.putText(image, label, (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        text_size = draw.textsize(label, font=font)
+        text_bg = [x1, max(y1 - text_size[1] - 8, 0), x1 + text_size[0] + 10, y1]
+        draw.rectangle(text_bg, fill=color)
+        draw.text((x1 + 5, max(y1 - text_size[1] - 5, 0)), label, fill='white', font=font)
     return image
 
 
-def run_detection(image_bgr: np.ndarray, model, threshold: float):
+def run_detection(image: Image.Image, model, threshold: float):
     if model is None:
         return []
     try:
-        image_rgb = bgr_to_rgb(image_bgr)
-        results = model(image_rgb, conf=threshold, verbose=False)
+        results = model(image, conf=threshold, verbose=False)
         detections = []
         for result in results:
             if result.boxes is None:
@@ -119,8 +174,8 @@ def run_detection(image_bgr: np.ndarray, model, threshold: float):
                     'confidence': conf,
                     'severity': severity,
                     'box': (x1, y1, x2, y2),
-                    'latitude': round(BASE_LAT + np.random.uniform(-0.003, 0.003), 6),
-                    'longitude': round(BASE_LON + np.random.uniform(-0.003, 0.003), 6),
+                    'latitude': round(BASE_LAT + random.uniform(-0.003, 0.003), 6),
+                    'longitude': round(BASE_LON + random.uniform(-0.003, 0.003), 6),
                     'timestamp': datetime.now().isoformat()
                 })
         return detections
@@ -250,14 +305,14 @@ def main():
         """, unsafe_allow_html=True)
         uploaded = st.file_uploader("Choose image", type=['jpg', 'jpeg', 'png', 'webp'])
         if uploaded is not None:
-            image_bgr = bytes_to_bgr(uploaded.read())
-            st.image(bgr_to_rgb(image_bgr), use_column_width=True)
+            image = bytes_to_pil(uploaded.read())
+            st.image(image, use_column_width=True)
             if st.button("Detect Damage"):
                 with st.spinner("Running YOLO detection..."):
-                    detections = run_detection(image_bgr, st.session_state.model, threshold)
+                    detections = run_detection(image, st.session_state.model, threshold)
                 if detections:
                     if show_boxes:
-                        st.image(bgr_to_rgb(draw_boxes(image_bgr, detections)), use_column_width=True)
+                        st.image(draw_boxes(image, detections), use_column_width=True)
                     for det in detections:
                         st.markdown(render_card(det), unsafe_allow_html=True)
                         st.session_state.detections.append(det)
@@ -282,14 +337,14 @@ def main():
         """, unsafe_allow_html=True)
         camera_image = st.camera_input("Capture road damage")
         if camera_image is not None:
-            image_bgr = bytes_to_bgr(camera_image.read())
-            st.image(bgr_to_rgb(image_bgr), use_column_width=True)
+            image = bytes_to_pil(camera_image.read())
+            st.image(image, use_column_width=True)
             if st.button("Analyze Capture"):
                 with st.spinner("Analyzing capture..."):
-                    detections = run_detection(image_bgr, st.session_state.model, threshold)
+                    detections = run_detection(image, st.session_state.model, threshold)
                 if detections:
                     if show_boxes:
-                        st.image(bgr_to_rgb(draw_boxes(image_bgr, detections)), use_column_width=True)
+                        st.image(draw_boxes(image, detections), use_column_width=True)
                     for det in detections:
                         st.markdown(render_card(det), unsafe_allow_html=True)
                         st.session_state.detections.append(det)

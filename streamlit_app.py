@@ -5,10 +5,8 @@ Real-time road damage detection using YOLOv8
 """
 
 import streamlit as st
-import cv2
-import numpy as np
 from ultralytics import YOLO
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import tempfile
 import os
 import time
@@ -89,15 +87,22 @@ def detect_damage(image, confidence_threshold=0.45):
     if st.session_state.model is None:
         return [], image
 
-    # Convert PIL to numpy array if needed
+    # Run inference directly on the PIL image
     if isinstance(image, Image.Image):
-        image = np.array(image)
+        image_pil = image.convert("RGB")
+    else:
+        image_pil = Image.open(image).convert("RGB")
 
-    # Run inference
-    results = st.session_state.model(image, conf=confidence_threshold, verbose=False)
+    results = st.session_state.model(image_pil, conf=confidence_threshold, verbose=False)
 
     detections = []
-    annotated_image = image.copy()
+    annotated_image = image_pil.copy()
+    draw = ImageDraw.Draw(annotated_image)
+
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
 
     for result in results:
         if result.boxes is not None:
@@ -121,13 +126,18 @@ def detect_damage(image, confidence_threshold=0.45):
                     severity = "Low"
                     color = (0, 255, 0)  # Green
 
-                # Draw bounding box
-                cv2.rectangle(annotated_image, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                # Draw bounding box using Pillow
+                box_coords = [int(x1), int(y1), int(x2), int(y2)]
+                draw.rectangle(box_coords, outline=color, width=3)
 
                 # Add label
                 label = f"{class_name}: {conf:.2f} ({severity})"
-                cv2.putText(annotated_image, label, (int(x1), int(y1)-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                text_position = (int(x1), max(int(y1) - 16, 0))
+                draw.rectangle(
+                    [text_position[0], text_position[1], text_position[0] + len(label) * 7 + 8, text_position[1] + 18],
+                    fill=(0, 0, 0, 180)
+                )
+                draw.text(text_position, label, fill=color, font=font)
 
                 detections.append({
                     'class': class_name,
